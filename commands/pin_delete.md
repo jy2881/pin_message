@@ -14,7 +14,8 @@ allowed-tools: Bash, Read, Write, Edit, Glob, AskUserQuestion
 
 执行：
 ```bash
-ENGINE=$(find "$HOME/.claude/plugins" "$HOME/workspace" -maxdepth 5 -path '*pin_message/scripts/pin.py' 2>/dev/null | head -1); command -v python3 >/dev/null && test -n "$ENGINE" && echo "ENGINE=$ENGINE" || echo "NO_ENGINE"
+ENGINE=$(find "$HOME/workspace/pin_message/scripts" "$HOME/.claude/plugins" -name pin.py 2>/dev/null | head -1)
+command -v python3 >/dev/null && [ -n "$ENGINE" ] && echo "ENGINE=$ENGINE" || echo "NO_ENGINE"
 ```
 
 输出以 `ENGINE=` 开头 → 走【引擎路径】；否则 → 走【手动路径】。

@@ -1,0 +1,14 @@
+{
+  "name": "pin-message",
+  "owner": {
+    "name": "jy2881"
+  },
+  "plugins": [
+    {
+      "name": "pin-message",
+      "source": "./.claude-plugin/plugin.json",
+      "description": "Pin important Q&A turns from your Claude Code session to ~/.claude/pin_message.md and recall them anytime.",
+      "version": "0.1.0"
+    }
+  ]
+}

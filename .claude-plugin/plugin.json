@@ -1,10 +1,14 @@
 {
   "name": "pin-message",
   "version": "0.2.0",
-  "description": "Pin important Q&A turns from your Claude Code or Codex CLI session to ~/.claude/pin_message.md and recall them anytime — like bookmarks for conversation history. Numbered-list picker works in both CLIs.",
+  "description": "Pin important Q&A turns from your Claude Code or Codex CLI session to a local markdown file and recall them anytime — like bookmarks for your conversation history. Four slash commands let you save the last exchange, search and pin any past question, browse and display pinned items, and delete them with confirmation. A deterministic Python engine auto-detects the platform and parses both transcript formats; every command also has a manual no-python fallback. Pinned content stays entirely on your machine.",
   "author": {
-    "name": "jy2881"
+    "name": "jy2881",
+    "url": "https://github.com/jy2881"
   },
+  "homepage": "https://github.com/jy2881/pin_message",
+  "repository": "https://github.com/jy2881/pin_message",
   "license": "MIT",
-  "keywords": ["pin", "bookmark", "history", "conversation", "memory"]
+  "keywords": ["pin", "bookmark", "history", "conversation", "memory", "claude-code", "codex"],
+  "commands": ["./commands/pin.md", "./commands/pin_search.md", "./commands/pin_show.md", "./commands/pin_delete.md"]
 }

@@ -1,14 +1,25 @@
 {
   "name": "pin-message",
   "owner": {
-    "name": "jy2881"
+    "name": "jy2881",
+    "url": "https://github.com/jy2881"
+  },
+  "metadata": {
+    "description": "Pin important Q&A turns from your Claude Code or Codex CLI session to a local markdown file and recall them anytime — bookmarks for your conversation history."
   },
   "plugins": [
     {
       "name": "pin-message",
       "source": "./.claude-plugin/plugin.json",
-      "description": "Pin important Q&A turns from your Claude Code or Codex CLI session and recall them anytime — numbered-list picker, dual-platform engine.",
-      "version": "0.2.0"
+      "description": "Pin important Q&A turns from your Claude Code or Codex CLI session and recall them anytime — bookmarks for your conversation history.",
+      "version": "0.2.0",
+      "author": {
+        "name": "jy2881"
+      },
+      "homepage": "https://github.com/jy2881/pin_message",
+      "repository": "https://github.com/jy2881/pin_message",
+      "license": "MIT",
+      "keywords": ["pin", "bookmark", "history", "conversation", "memory"]
     }
   ]
 }

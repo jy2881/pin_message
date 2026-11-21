@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-"""pin_message engine — Claude Code 对话 pin 插件的确定性引擎层。
+"""pin_message engine — Claude Code / Codex 双平台对话 pin 插件的确定性引擎层。
 
-命令提示词（commands/*.md）通过 Bash 调用本子命令，引擎负责一切
-解析/读写/输出，模型只负责渲染 AskUserQuestion 选择框。
+命令提示词（commands/*.md）通过 Bash 调用本子命令，引擎负责一切解析/读写/输出，
+模型只负责把引擎输出的编号列表渲染给用户并引导用户回复数字（统一编号列表
+协议，替代 v1 的 AskUserQuestion 分页协议；会话内无原生选择器可用，编号列表
+是跨 CLI 社区标准解法）。
 
-解析管线（transcript → QA 对）：
-    ~/.claude/projects/<slug>/*.jsonl
-        │
-        ▼  逐行解析（单行损坏跳过计数；连续≥20行缺键 → bad_format fail-loud）
-    entries
-        │
-        ▼  6 条过滤（isSidechain / isMeta / tool_result 块 / 纯 text /
-        │           无 <command-name> / 无 [Request interrupted 标记）
-    真实用户提问
-        │
-        ▼  配对：其后最近含 text 块的 assistant；遇下一合格 user 即停止
-    QA 对 ──compress──▶ display（[Pasted text #N +X lines] 风格）
+解析管线（按 --platform 选择来源）：
+
+    cc     ~/.claude/projects/<slug>/*.jsonl
+    codex  ~/.codex/sessions/**/rollout-*.jsonl（mtime 最新者）
+              │
+              ▼  平台探测：auto → 两侧皆存在取 mtime 新者（stderr warn）；
+              │              皆无 → no_transcript_dir
+        entries（codex 行归一化为与 CC 同构的 {type,uuid,timestamp,message.content}）
+              │
+              ▼  CC：6 条过滤；Codex：排除 function_call*/local_shell_call*/
+              │       turn_context/reasoning 等已知噪声；未知 schema 连续 ≥20 行
+              │       → codex_parse fail-loud（附行样本，不静默猜）
+        真实用户提问
+              │
+              ▼  配对：其后最近 textual assistant；遇下一合格 user 即停止
+        QA 对 ──compress──▶ display（[Pasted text #N +X lines] 风格）
+
+编号列表协议（v2，替代 v1 分页协议）：
+    list_items 一次输出 ≤15 条（MAX_ITEMS，truncated 标记截断），每条
+    {index, display, ts, session, uuid, pin_no, preview}；
+    show/delete 的位置参数为纯数字 = pin_no 直达，跳过列表。
 
 输出契约（命令提示词依赖，勿随意改）：
     qa_pair / search_results / pin_content / write_result /
@@ -43,17 +54,18 @@ from typing import Any, Iterator, Optional
 
 PIN_FILE = Path(os.environ.get("PIN_MESSAGE_FILE") or (Path.home() / ".claude" / "pin_message.md"))
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 FORMAT_HEADER = "<!-- pin-message-format: 1 -->"
 STALE_SECONDS = 300          # transcript mtime 早于 5 分钟视为可疑
 LOCK_TIMEOUT = 2.0           # flock 等待秒数
-BAD_FORMAT_CONSECUTIVE = 20  # 连续缺键行数阈值
+BAD_FORMAT_CONSECUTIVE = 20  # 连续缺键/未知 schema 行数阈值
 LONG_TEXT_THRESHOLD = 500    # 单条文本超过此长度触发压缩（verbatim 形态）
 DISPLAY_MAX = 80             # display 摘要手打文字最大长度
-PAGE_SIZE = 3                # AskUserQuestion 每轮候选数（第 4 个选项固定"下一页"）
-MAX_PAGES = 5                # 翻页上限，共 15 条
+MAX_ITEMS = 15               # 编号列表单次截断上限（分页协议已删）
 
 ERROR_CODES = (
-    "empty_session|no_match|lock_timeout|bad_format|io_error|no_transcript_dir"
+    "empty_session|no_match|lock_timeout|bad_format|codex_parse|io_error"
+    "|no_transcript_dir|no_pins|duplicate"
 )
 
 
@@ -69,11 +81,11 @@ def fail(code: str, message: str, exit_code: int = 0) -> "None":
     sys.exit(exit_code)
 
 
-# ================================================================ transcript 段
+# ================================================================ transcript 段（CC）
 
 
 class BadFormatError(Exception):
-    """transcript 结构与预期不符（Claude Code 可能升级了格式）。"""
+    """transcript 结构与预期不符（CLI 可能升级了格式）。"""
 
 
 def slug_for(cwd: str) -> str:
@@ -82,17 +94,17 @@ def slug_for(cwd: str) -> str:
 
 
 def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:
-    """定位当前 session 的 transcript 文件（cwd-slug 目录下 mtime 最新者）。
+    """定位 CC 当前 session 的 transcript（cwd-slug 目录下 mtime 最新者）。
 
-    返回 (path, warn)。目录不存在 → (None, error 载荷由调用方处理)。
-    mtime 早于 STALE_SECONDS → 附 stale_transcript warn。
+    返回 (path, payload)。目录不存在/无 jsonl → (None, error 载荷)。
+    mtime 早于 STALE_SECONDS → (path, stale_transcript warn)。
     """
     slug_dir = PROJECTS_DIR / slug_for(cwd)
     if not slug_dir.is_dir():
         return None, {
             "type": "error",
             "code": "no_transcript_dir",
-            "message": f"找不到会话记录目录：{slug_dir}",
+            "message": f"找不到 CC 会话记录目录：{slug_dir}",
         }
     files = sorted(slug_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
     if not files:
@@ -102,9 +114,8 @@ def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:
             "message": f"目录中没有任何 .jsonl 会话文件：{slug_dir}",
         }
     newest = files[-1]
-    warn = None
     if time.time() - newest.stat().st_mtime > STALE_SECONDS:
-        warn = {
+        return newest, {
             "type": "warn",
             "code": "stale_transcript",
             "message": (
@@ -112,11 +123,11 @@ def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:
                 f"{STALE_SECONDS // 60} 分钟，可能是后台会话。确认后继续。"
             ),
         }
-    return newest, warn
+    return newest, None
 
 
 def iter_entries(path: Path) -> Iterator[dict]:
-    """逐行解析 transcript JSONL。
+    """逐行解析 CC transcript JSONL。
 
     单行 JSON 损坏 → 跳过（stderr 计数警告）；连续 BAD_FORMAT_CONSECUTIVE 行
     虽为合法 JSON 但缺预期键 → BadFormatError（fail-loud，不静默猜）。
@@ -253,7 +264,7 @@ _PASTED_PLACEHOLDER_RE = re.compile(r"^\[Pasted text")
 def compress_display(text: str) -> str:
     """把用户提问压缩成一行 display 摘要。
 
-    两种 transcript 形态都有预案（Spike 实验前保守实现双分支）：
+    两种 transcript 形态都有预案：
     (a) 记录为 [Pasted text #N +X lines] 占位符 → 保留占位符原样；
     (b) 原文 verbatim 且总长 > 阈值 → 压缩为 [Pasted text +N lines] 风格。
     """
@@ -270,6 +281,81 @@ def compress_display(text: str) -> str:
         suffix = f"[Pasted text +{len(lines)} lines]"
         return f"{head} {suffix}".strip()
     return " ".join(lines)[:DISPLAY_MAX]
+
+
+# ================================================================ codex 段
+# CODEX-FORMAT: verify on real machine —— 实现见 codex_adapter.py（本文件超 800 行
+# 上限后按 Eng Review 决策拆分）；未知 schema 一律 fail-loud（codex_parse）。
+
+from codex_adapter import (  # noqa: E402
+    CODEX_SESSIONS_DIR,
+    CodexParseError,
+    iter_codex_entries,
+    locate_codex_transcript,
+)
+
+
+# ================================================================ 平台探测
+
+
+def resolve_transcript(
+    cwd: str, platform: str
+) -> tuple[Optional[Path], Optional[str], Optional[dict]]:
+    """按 platform（auto|cc|codex）定位 transcript。
+
+    返回 (path, source, payload)：payload 为 warn（不阻塞）或 error（中止）。
+    auto：两侧皆存在 → mtime 新者胜 + platform_ambiguous warn；皆无 → no_transcript_dir。
+    """
+    cc_path = cx_path = None
+    cc_payload: Optional[dict] = None
+    if platform in ("auto", "cc"):
+        cc_path, cc_payload = locate_transcript(cwd)
+    if platform in ("auto", "codex"):
+        cx_path = locate_codex_transcript()
+
+    if platform == "auto":
+        if cc_path and cx_path:
+            source, newest = max(
+                (("cc", cc_path), ("codex", cx_path)),
+                key=lambda t: t[1].stat().st_mtime,
+            )
+            warn = {
+                "type": "warn",
+                "code": "platform_ambiguous",
+                "message": (
+                    "CC 与 Codex 会话记录同时存在，已选用较新的 "
+                    f"{source} 侧；可用 --platform cc|codex 强制指定"
+                ),
+            }
+            return newest, source, warn
+        if cc_path:
+            return cc_path, "cc", cc_payload
+        if cx_path:
+            return cx_path, "codex", None
+        return None, None, {
+            "type": "error",
+            "code": "no_transcript_dir",
+            "message": (
+                "找不到会话记录目录：CC ~/.claude/projects 与 "
+                "Codex ~/.codex/sessions 均不存在"
+            ),
+        }
+    if platform == "cc":
+        if cc_path:
+            return cc_path, "cc", cc_payload
+        return None, None, cc_payload or {
+            "type": "error",
+            "code": "no_transcript_dir",
+            "message": f"找不到 CC 会话记录目录：{PROJECTS_DIR / slug_for(cwd)}",
+        }
+    # codex
+    if cx_path:
+        return cx_path, "codex", None
+    return None, None, {
+        "type": "error",
+        "code": "no_transcript_dir",
+        "message": f"找不到 Codex 会话记录目录：{CODEX_SESSIONS_DIR}",
+    }
 
 
 # ================================================================ pinstore 段
@@ -424,32 +510,25 @@ class PinStore:
 
 
 def session_id_of(path: Path) -> str:
-    return path.stem[:8]
+    """session 标识：CC 取文件名前 8 字符；codex rollout-<ts>-<uuid> 取末段 uuid 前 8。"""
+    name = path.stem
+    if name.startswith("rollout-"):
+        return name.split("-")[-1][:8]
+    return name[:8]
 
 
-def page_items(items: list[dict], page: int) -> dict:
-    """应用分页协议：每页 3 条，最多 5 页。"""
-    if page < 1:
-        page = 1
-    if page > MAX_PAGES:
-        return {
-            "type": "error",
-            "code": "no_match",
-            "message": f"已展示全部 {MAX_PAGES * PAGE_SIZE} 条，可换查询词重试",
-        }
-    start = (page - 1) * PAGE_SIZE
-    chunk = items[start: start + PAGE_SIZE]
-    if not chunk:
-        return {"type": "error", "code": "no_match",
-                "message": "没有更多结果，可换查询词重试"}
+def list_items(items: list[dict]) -> dict:
+    """编号列表协议：一次输出 ≤MAX_ITEMS 条，truncated 标记截断（分页协议已删）。"""
+    chunk = items[:MAX_ITEMS]
     return {
         "type": "search_results",
-        "page": page,
-        "has_more": len(items) > start + PAGE_SIZE and page < MAX_PAGES,
+        "total": len(items),
+        "truncated": len(items) > MAX_ITEMS,
         "items": [
             {
                 "index": i + 1,
                 "display": e["display"],
+                "ts": (e.get("timestamp", "") or "")[:16].replace("T", " "),
                 "session": e.get("session", ""),
                 "uuid": e.get("uuid", ""),
                 "pin_no": e.get("pin_no"),
@@ -468,20 +547,27 @@ def filter_query(items: list[dict], query: Optional[str], key: str = "display") 
     return [e for e in items if q in e.get(key, "").lower()]
 
 
-def load_pairs(cwd: str) -> tuple[Optional[list[dict]], Optional[Path], Optional[dict]]:
-    """定位 transcript → 解析 → QA 对。
+def load_pairs(
+    cwd: str, platform: str
+) -> tuple[Optional[list[dict]], Optional[Path], Optional[str], Optional[dict]]:
+    """平台探测 → transcript 解析 → QA 对。
 
-    第三个返回值是 warn（stale_transcript）或 error 载荷。warn 不阻塞，
-    由各 cmd 决定提示方式；error 才中止。
+    返回 (pairs, path, source, payload)：payload 为 warn（不阻塞）或 error（中止）。
+    codex 解析失败 → codex_parse 错误码（fail-loud）；CC → bad_format。
     """
-    path, warn = locate_transcript(cwd)
+    path, source, payload = resolve_transcript(cwd, platform)
     if path is None:
-        return None, None, warn
+        return None, None, None, payload
     try:
-        entries = list(iter_entries(path))
+        if source == "codex":
+            entries = list(iter_codex_entries(path))
+        else:
+            entries = list(iter_entries(path))
+    except CodexParseError as exc:
+        return None, None, source, {"type": "error", "code": "codex_parse", "message": str(exc)}
     except BadFormatError as exc:
-        return None, None, {"type": "error", "code": "bad_format", "message": str(exc)}
-    return extract_qa_pairs(entries), path, warn
+        return None, None, source, {"type": "error", "code": "bad_format", "message": str(exc)}
+    return extract_qa_pairs(entries), path, source, payload
 
 
 def emit_warn_if_any(payload: Optional[dict]) -> None:
@@ -490,12 +576,29 @@ def emit_warn_if_any(payload: Optional[dict]) -> None:
         print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
 
 
+def _fail_if_error(payload: Optional[dict]) -> bool:
+    """error 载荷 → emit + True（调用方 return）；否则 False。"""
+    if payload and payload.get("type") == "error":
+        emit(payload)
+        return True
+    return False
+
+
+def _pin_no_from_args(args: argparse.Namespace) -> Optional[int]:
+    """数字直达：--pin-no 或位置参数 target 为纯数字 → pin_no；否则 None（走列表）。"""
+    if getattr(args, "pin_no", None) is not None:
+        return args.pin_no
+    target = getattr(args, "target", None)
+    if target and target.isdigit():
+        return int(target)
+    return None
+
+
 def cmd_last(args: argparse.Namespace) -> None:
-    pairs, path, err = load_pairs(args.cwd)
-    if err and err.get("type") == "error":
-        emit(err)
+    pairs, path, source, payload = load_pairs(args.cwd, args.platform)
+    if _fail_if_error(payload):
         return
-    emit_warn_if_any(err)
+    emit_warn_if_any(payload)
     if not pairs:
         fail("empty_session", "当前 session 还没有可 pin 的对话")
     pair = pairs[-1]
@@ -510,19 +613,19 @@ def cmd_last(args: argparse.Namespace) -> None:
 
 
 def cmd_search(args: argparse.Namespace) -> None:
-    pairs, path, err = load_pairs(args.cwd)
-    if err and err.get("type") == "error":
-        emit(err)
+    pairs, path, source, payload = load_pairs(args.cwd, args.platform)
+    if _fail_if_error(payload):
         return
-    emit_warn_if_any(err)
+    emit_warn_if_any(payload)
     if not pairs:
         fail("empty_session", "当前 session 还没有可 pin 的对话")
-    recent = list(reversed(pairs))[: MAX_PAGES * PAGE_SIZE]  # 倒序，最近在前
+    recent = list(reversed(pairs))  # 倒序，最近在前；列表层截断到 MAX_ITEMS 并标记 truncated
     items = [
         {
             "display": compress_display(p["question"]),
             "uuid": p["uuid"],
             "session": session_id_of(path),
+            "timestamp": p.get("timestamp", ""),
             "answer": p["answer"],
             "question": p["question"],
         }
@@ -531,7 +634,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     items = filter_query(items, args.query)
     if not items:
         fail("no_match", f"没有匹配「{args.query}」的提问")
-    emit(page_items(items, args.page))
+    emit(list_items(items))
 
 
 def store_items_for_listing(query: Optional[str]) -> list[dict]:
@@ -544,6 +647,7 @@ def store_items_for_listing(query: Optional[str]) -> list[dict]:
             "answer": e.get("answer", ""),
             "question": e.get("question", ""),
             "session": e.get("session", ""),
+            "timestamp": e.get("timestamp", ""),
         }
         for e in reversed(entries)  # 最近 pin 在前
     ]
@@ -551,18 +655,23 @@ def store_items_for_listing(query: Optional[str]) -> list[dict]:
 
 
 def cmd_pins(args: argparse.Namespace) -> None:
-    items = store_items_for_listing(args.query)
+    items = store_items_for_listing(getattr(args, "query", None))
     if not items:
-        msg = f"没有匹配「{args.query}」的 pin" if args.query else "还没有 pin 任何内容"
-        fail("no_match", msg)
-    emit(page_items(items, args.page))
+        if getattr(args, "query", None):
+            fail("no_match", f"没有匹配「{args.query}」的 pin")
+        fail("no_pins", "（还没有 pinned 消息）")
+    emit(list_items(items))
 
 
 def cmd_show(args: argparse.Namespace) -> None:
+    pin_no = _pin_no_from_args(args)
+    if pin_no is None:
+        cmd_pins(args)  # 渲染编号列表；提示词引导用户回复数字后 /pin_show N 直达
+        return
     entries, _ = read_store()
-    target = next((e for e in entries if e["pin_no"] == args.pin_no), None)
+    target = next((e for e in entries if e["pin_no"] == pin_no), None)
     if target is None:
-        fail("no_match", f"PIN #{args.pin_no} 不存在")
+        fail("no_match", f"PIN #{pin_no} 不存在")
     emit({
         "type": "pin_content",
         "pin_no": target["pin_no"],
@@ -571,12 +680,14 @@ def cmd_show(args: argparse.Namespace) -> None:
     })
 
 
-def find_pair_by_uuid(cwd: str, uuid: str) -> tuple[Optional[dict], Optional[Path], Optional[dict]]:
-    pairs, path, err = load_pairs(cwd)
-    if err and err.get("type") == "error":
-        return None, None, err
+def find_pair_by_uuid(
+    cwd: str, platform: str, uuid: str
+) -> tuple[Optional[dict], Optional[Path], Optional[dict]]:
+    pairs, path, source, payload = load_pairs(cwd, platform)
+    if payload and payload.get("type") == "error":
+        return None, None, payload
     for p in pairs or []:
-        if p["uuid"] == uuid:
+        if p["uuid"] and p["uuid"] == uuid:
             return p, path, None
     return None, None, {"type": "error", "code": "no_match",
                         "message": f"当前 session 中找不到 uuid={uuid} 的问答对"}
@@ -599,7 +710,7 @@ def write_pair(pair: dict, session: str) -> None:
 
 
 def cmd_write(args: argparse.Namespace) -> None:
-    pair, path, err = find_pair_by_uuid(args.cwd, args.uuid)
+    pair, path, err = find_pair_by_uuid(args.cwd, args.platform, args.uuid)
     if err:
         emit(err)
         return
@@ -607,26 +718,29 @@ def cmd_write(args: argparse.Namespace) -> None:
 
 
 def cmd_write_last(args: argparse.Namespace) -> None:
-    pairs, path, err = load_pairs(args.cwd)
-    if err and err.get("type") == "error":
-        emit(err)
+    pairs, path, source, payload = load_pairs(args.cwd, args.platform)
+    if _fail_if_error(payload):
         return
-    emit_warn_if_any(err)
+    emit_warn_if_any(payload)
     if not pairs:
         fail("empty_session", "当前 session 还没有可 pin 的对话")
     write_pair(pairs[-1], session_id_of(path))
 
 
 def cmd_delete(args: argparse.Namespace) -> None:
+    pin_no = _pin_no_from_args(args)
+    if pin_no is None:
+        cmd_pins(args)  # 渲染编号列表；提示词引导用户回复数字后 /pin_delete N 直达
+        return
     with PinStore() as store:
-        removed = store.delete(args.pin_no)
+        removed = store.delete(pin_no)
     if removed is None:
-        fail("no_match", f"PIN #{args.pin_no} 不存在")
+        fail("no_match", f"PIN #{pin_no} 不存在")
     entries, _ = read_store()
     emit({
         "type": "delete_result",
         "ok": True,
-        "removed_pin_no": args.pin_no,
+        "removed_pin_no": pin_no,
         "remaining": len(entries),
     })
 
@@ -634,20 +748,20 @@ def cmd_delete(args: argparse.Namespace) -> None:
 def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(prog="pin.py")
     parser.add_argument("--cwd", default=os.getcwd())
+    parser.add_argument("--platform", choices=("auto", "cc", "codex"), default="auto")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("last")
 
     p = sub.add_parser("search")
     p.add_argument("query", nargs="?")
-    p.add_argument("--page", type=int, default=1)
 
     p = sub.add_parser("pins")
     p.add_argument("query", nargs="?")
-    p.add_argument("--page", type=int, default=1)
 
     p = sub.add_parser("show")
-    p.add_argument("--pin-no", type=int, required=True)
+    p.add_argument("target", nargs="?")
+    p.add_argument("--pin-no", type=int)
 
     p = sub.add_parser("write")
     p.add_argument("--uuid", required=True)
@@ -655,7 +769,8 @@ def main(argv: Optional[list] = None) -> None:
     sub.add_parser("write-last")
 
     p = sub.add_parser("delete")
-    p.add_argument("--pin-no", type=int, required=True)
+    p.add_argument("target", nargs="?")
+    p.add_argument("--pin-no", type=int)
 
     args = parser.parse_args(argv)
     handlers = {

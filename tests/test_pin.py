@@ -8,6 +8,7 @@ fixture 构造说明：
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pin  # noqa: E402
+import codex_adapter  # noqa: E402
 
 
 # ---------------------------------------------------------------- helpers
@@ -79,11 +81,51 @@ def write_transcript(tmp_path, entries, name="sess-12345678.jsonl"):
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    """把 PIN_FILE / PROJECTS_DIR 重定向到 tmp，cwd 固定为 /tmp/proj。"""
+    """把 PIN_FILE / PROJECTS_DIR / Codex sessions 重定向到 tmp，cwd 固定为 /tmp/proj。
+
+    v2：auto 平台探测会看真实的 ~/.codex/sessions，必须隔离，否则测试
+    结果取决于本机是否装过 codex。
+    """
     monkeypatch.setattr(pin, "PIN_FILE", tmp_path / "pin_message.md")
     monkeypatch.setattr(pin, "PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(codex_adapter, "CODEX_SESSIONS_DIR", tmp_path / "codex_sessions")
     monkeypatch.setattr(pin, "STALE_SECONDS", -1)  # 测试里文件总是"新鲜"
     return {"cwd": "/tmp/proj", "tmp": tmp_path}
+
+
+# ---------------------------------------------------------------- codex helpers（合成 rollout fixture）
+
+
+def cx_message(role, text, msg_id):
+    """response_item/message 行：role=user 用 input_text，assistant 用 output_text。"""
+    block_type = "input_text" if role == "user" else "output_text"
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": role,
+            "id": msg_id,
+            "content": [{"type": block_type, "text": text}],
+        },
+    }
+
+
+def cx_skip(ptype):
+    """已知噪声行（工具回传/推理等），带最小可用字段。"""
+    return {"type": "response_item", "payload": {"type": ptype, "output": "noise"}}
+
+
+def cx_top_skip(top):
+    """顶层已知非条目行（turn_context 等）。"""
+    return {"type": top, "context": "noise"}
+
+
+def write_rollout(sessions_dir, lines, name="rollout-20261121-090000-abcdef12.jsonl"):
+    day_dir = sessions_dir / "2026" / "11" / "21"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    f = day_dir / name
+    f.write_text("\n".join(json.dumps(e) for e in lines), encoding="utf-8")
+    return f
 
 
 # ---------------------------------------------------------------- spec 1
@@ -317,15 +359,16 @@ def test_atomic_write_preserves_old_on_failure(env, monkeypatch):
 # ---------------------------------------------------------------- spec 13
 
 
-def test_pagination_and_page_cap():
-    items = [{"display": f"问题{i}", "uuid": f"u{i}"} for i in range(20)]
-    page1 = pin.page_items(items, 1)
-    assert page1["type"] == "search_results"
-    assert len(page1["items"]) == 3 and page1["has_more"]
-    page5 = pin.page_items(items, 5)
-    assert len(page5["items"]) == 3 and not page5["has_more"]
-    over = pin.page_items(items, 6)
-    assert over["type"] == "error" and "已展示全部" in over["message"]
+def test_list_items_truncated_at_15():
+    """v2 编号列表协议：单次截断上限 MAX_ITEMS=15（分页协议已删）。"""
+    items = [{"display": f"问题{i}", "uuid": f"u{i}", "answer": "A"} for i in range(20)]
+    out = pin.list_items(items)
+    assert out["type"] == "search_results"
+    assert out["total"] == 20 and out["truncated"] is True
+    assert len(out["items"]) == pin.MAX_ITEMS == 15
+    assert [it["index"] for it in out["items"]] == list(range(1, 16))
+    out2 = pin.list_items(items[:15])
+    assert out2["truncated"] is False
 
 
 def test_stale_transcript_warn(env, tmp_path, monkeypatch):
@@ -414,3 +457,262 @@ def test_end_to_end_roundtrip(env, capsys):
     assert out["items"][0]["display"] == "端到端问题"
     pin.main(["--cwd", env["cwd"], "show", "--pin-no", "1"])
     assert json.loads(capsys.readouterr().out)["answer"] == "端到端回答"
+
+
+# ================================================================ v2 新增 specs
+# 对应测试计划：~/.gstack/projects/pin-message/panjianwei-main-eng-review-test-plan-20261121-090000.md
+
+
+# ---- [GAP→新增1] codex 基本提取：response_item/message/user/input_text → QA 对
+
+
+def test_codex_basic_extraction(env):
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "codex 问题一", "m1"),
+        cx_message("assistant", "codex 回答一", "m2"),
+    ])
+    # cwd 不存在 → CC 探测失败 → auto 落到 codex
+    pairs, path, source, payload = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert source == "codex"
+    assert payload is None
+    assert len(pairs) == 1
+    assert pairs[0]["question"] == "codex 问题一"
+    assert pairs[0]["answer"] == "codex 回答一"
+    assert pairs[0]["uuid"] == "m2"
+
+
+# ---- [GAP→新增2] 排除 function_call_output、local_shell_call_output
+
+
+def test_codex_excludes_tool_outputs(env):
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "问题", "m1"),
+        cx_skip("function_call_output"),
+        cx_skip("local_shell_call_output"),
+        cx_skip("function_call"),
+        cx_skip("local_shell_call"),
+        cx_message("assistant", "回答", "m2"),
+    ])
+    pairs, _, source, _ = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert source == "codex"
+    assert len(pairs) == 1
+    assert pairs[0]["answer"] == "回答"
+
+
+# ---- [GAP→新增3] 排除 turn_context、reasoning 条目（已知噪声不计 fail-loud）
+
+
+def test_codex_excludes_turn_context_and_reasoning(env):
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_top_skip("turn_context"),
+        cx_skip("reasoning"),
+        cx_message("user", "问题", "m1"),
+        cx_message("assistant", "回答", "m2"),
+        cx_top_skip("token_count"),
+    ])
+    pairs, _, source, payload = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert source == "codex"
+    assert payload is None  # 无 codex_parse 错误
+    assert [p["question"] for p in pairs] == ["问题"]
+
+
+# ---- [GAP→新增4] 配对边界：下一 user message 出现即停止
+
+
+def test_codex_pairing_boundary(env):
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "问题A", "m1"),
+        cx_message("assistant", "回答A", "m2"),
+        cx_message("user", "问题B", "m3"),
+        cx_message("assistant", "回答B", "m4"),
+    ])
+    pairs, _, _, _ = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert [p["question"] for p in pairs] == ["问题A", "问题B"]
+    assert pairs[0]["answer"] == "回答A"
+    # 无回答的提问不得跨界配对
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "问题X", "x1"),
+        cx_message("user", "问题Y", "x2"),
+        cx_message("assistant", "回答Y", "x3"),
+    ], name="rollout-20261121-100000-ffffffff.jsonl")
+    pairs2, _, _, _ = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert pairs2[0]["question"] == "问题X" and pairs2[0]["has_answer"] is False
+    assert pairs2[1]["answer"] == "回答Y"
+
+
+# ---- [GAP→新增5] 未知行 schema → codex_parse fail-loud（含行样本，不静默跳过）
+
+
+def test_codex_unknown_schema_fail_loud(env):
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        {"type": "totally_new_format", "data": {"nested": True}}
+    ] * (pin.BAD_FORMAT_CONSECUTIVE + 1))
+    pairs, path, source, payload = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert pairs is None
+    assert payload["type"] == "error" and payload["code"] == "codex_parse"
+    assert "totally_new_format" in payload["message"]  # 行样本随错误上报
+
+
+def test_codex_malformed_lines_skipped(env):
+    f = write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "Q", "m1"),
+        cx_message("assistant", "A", "m2"),
+    ])
+    with f.open("a") as fh:
+        fh.write("\n{not json}\n{broken")
+    pairs, _, source, _ = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert source == "codex" and len(pairs) == 1
+
+
+# ---- [GAP→新增6] 平台自动探测：cc-only / codex-only / both（mtime 新者胜 + warn）
+
+
+def test_platform_cc_only(env):
+    write_transcript(env["tmp"], [
+        user_entry("CC 问题", uuid="u1"),
+        assistant_entry("CC 回答", uuid="a1"),
+    ])
+    pairs, path, source, payload = pin.load_pairs(env["cwd"], "auto")
+    assert source == "cc"
+    assert pairs and pairs[0]["question"] == "CC 问题"
+
+
+def test_platform_codex_only(env):
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "codex 问题", "m1"),
+        cx_message("assistant", "codex 回答", "m2"),
+    ])
+    pairs, path, source, payload = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert source == "codex"
+    assert pairs and pairs[0]["question"] == "codex 问题"
+
+
+def test_platform_both_picks_newer_and_warns(env):
+    cc_file = write_transcript(env["tmp"], [
+        user_entry("CC 问题", uuid="u1"),
+        assistant_entry("CC 回答", uuid="a1"),
+    ])
+    cx_file = write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "codex 问题", "m1"),
+        cx_message("assistant", "codex 回答", "m2"),
+    ])
+    now = time.time()
+    # CC 更新 → 选 cc
+    os.utime(cc_file, (now + 100, now + 100))
+    os.utime(cx_file, (now, now))
+    path, source, payload = pin.resolve_transcript(env["cwd"], "auto")
+    assert source == "cc" and payload["code"] == "platform_ambiguous"
+    # Codex 更新 → 选 codex
+    os.utime(cc_file, (now, now))
+    os.utime(cx_file, (now + 100, now + 100))
+    path, source, payload = pin.resolve_transcript(env["cwd"], "auto")
+    assert source == "codex" and payload["code"] == "platform_ambiguous"
+
+
+def test_platform_both_warn_goes_to_stderr(env, capsys):
+    write_transcript(env["tmp"], [
+        user_entry("CC 问题", uuid="u1"),
+        assistant_entry("CC 回答", uuid="a1"),
+    ])
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "codex 问题", "m1"),
+        cx_message("assistant", "codex 回答", "m2"),
+    ])
+    pin.main(["--cwd", env["cwd"], "last"])
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["type"] == "qa_pair"
+    assert "platform_ambiguous" in captured.err
+
+
+# ---- [GAP→新增7] --platform cc|codex 强制覆盖
+
+
+def test_platform_force_override(env, capsys):
+    write_transcript(env["tmp"], [
+        user_entry("CC 问题", uuid="u1"),
+        assistant_entry("CC 回答", uuid="a1"),
+    ])
+    write_rollout(codex_adapter.CODEX_SESSIONS_DIR, [
+        cx_message("user", "codex 问题", "m1"),
+        cx_message("assistant", "codex 回答", "m2"),
+    ])
+    # 强制 codex：即使 CC 记录更新也不用
+    pin.main(["--cwd", env["cwd"], "--platform", "codex", "last"])
+    assert json.loads(capsys.readouterr().out)["question"] == "codex 问题"
+    # 强制 cc
+    pin.main(["--cwd", env["cwd"], "--platform", "cc", "last"])
+    assert json.loads(capsys.readouterr().out)["question"] == "CC 问题"
+
+
+def test_platform_neither_error(env):
+    _, _, _, payload = pin.load_pairs("/nonexistent/cwd", "auto")
+    assert payload["type"] == "error" and payload["code"] == "no_transcript_dir"
+
+
+# ---- [GAP→新增9] show/delete 纯数字参数 = pin_no 直达，跳过列表
+
+
+def test_numeric_direct_show_and_delete(env, capsys):
+    with pin.PinStore() as store:
+        store.append("u1", "s", "Q1", "A1", "2026-11-21T09:00:00")
+        store.append("u2", "s", "Q2", "A2", "2026-11-21T09:05:00")
+    pin.main(["show", "2"])  # 位置参数纯数字 → 直达
+    out = json.loads(capsys.readouterr().out)
+    assert out["type"] == "pin_content" and out["question"] == "Q2"
+    pin.main(["delete", "1"])
+    assert json.loads(capsys.readouterr().out)["type"] == "delete_result"
+    entries, _ = pin.read_store()
+    assert [e["pin_no"] for e in entries] == [1]  # 重新编号
+    assert entries[0]["question"] == "Q2"
+
+
+# ---- [GAP→新增10] pin 文件 0 条 → no_pins 错误码
+
+
+def test_no_pins_error(env, capsys):
+    for cmd in (["pins"], ["show"], ["delete"]):
+        with pytest.raises(SystemExit):  # fail() 以 sys.exit(0) 结束
+            pin.main(cmd)
+        assert json.loads(capsys.readouterr().out)["code"] == "no_pins"
+    # search 语义不同：空 session 是 empty_session，不属于 no_pins
+
+
+# ---- [GAP→新增11] install.sh 幂等：重复跑无副作用；Codex 分支创建目录 + 空 pin 文件
+
+
+def test_install_sh_idempotent(tmp_path):
+    repo = Path(__file__).resolve().parent.parent
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "PIN_MESSAGE_FILE": str(tmp_path / "custom" / "pin.md"),
+    }
+
+    def run_install():
+        return subprocess.run(
+            ["bash", str(repo / "install.sh")],
+            capture_output=True, text=True, env=env, cwd=str(repo),
+        )
+
+    r1 = run_install()
+    assert r1.returncode == 0, r1.stderr
+    # CC 分支：4 命令 symlink + 引擎 symlink
+    for cmd in ("pin", "pin_search", "pin_show", "pin_delete"):
+        link = tmp_path / ".claude" / "commands" / f"{cmd}.md"
+        assert link.is_symlink() and "pin" in link.read_text(encoding="utf-8")
+    assert (tmp_path / ".claude" / "plugins" / "pin_message" / "pin.py").is_symlink()
+    assert (tmp_path / ".claude" / "plugins" / "pin_message" / "codex_adapter.py").is_symlink()
+    # Codex 分支：prompts（4）+ skills（4）+ pin 文件（PIN_MESSAGE_FILE 覆盖路径）
+    for cmd in ("pin", "pin_search", "pin_show", "pin_delete"):
+        assert (tmp_path / ".codex" / "prompts" / f"{cmd}.md").exists()
+        assert (tmp_path / ".agents" / "skills" / cmd / "SKILL.md").exists()
+    pin_file = tmp_path / "custom" / "pin.md"
+    assert pin_file.read_text(encoding="utf-8").splitlines()[0] == pin.FORMAT_HEADER
+    # 幂等：第二次运行不重建/覆盖 pin 文件，且报告"跳过"
+    before = pin_file.read_text(encoding="utf-8")
+    r2 = run_install()
+    assert r2.returncode == 0, r2.stderr
+    assert pin_file.read_text(encoding="utf-8") == before
+    assert "已存在，跳过" in r2.stdout
+

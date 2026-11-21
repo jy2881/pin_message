@@ -1,14 +1,17 @@
 ---
-description: 搜索已 pin 的内容，选中后展示完整问答
-argument-hint: "[查询词]"
-allowed-tools: Bash, Read, Write, Edit, Glob, AskUserQuestion
+description: 查看已 pin 的内容，回复数字选中后展示完整问答
+argument-hint: "[编号|查询词]"
+allowed-tools: Bash, Read, Write, Edit, Glob
 ---
 
 # /pin_show — 查看已 Pin 的内容
 
-列出 `~/.claude/pin_message.md` 中已 pin 的条目，用 AskUserQuestion 选择框让用户选中一条，展示其完整问答。
+列出 `~/.claude/pin_message.md` 中已 pin 的条目（**编号列表**），用户回复数字选中一条，展示其完整问答。
 
-参数 `$ARGUMENTS` = 查询词（可空，大小写不敏感子串匹配，只匹配问题摘要不匹配回答正文）。无参数时列出全部条目（最近在前）。
+参数 `$ARGUMENTS`：
+- **纯数字**（如 `/pin_show 3`）→ 直达：跳过列表，直接展示 PIN #3
+- 其他文本 → 查询词（大小写不敏感子串匹配，只匹配问题摘要不匹配回答正文）
+- 空 → 列出全部条目（最近在前）
 
 ## 步骤 1：检测引擎
 
@@ -23,29 +26,30 @@ command -v python3 >/dev/null && [ -n "$ENGINE" ] && echo "ENGINE=$ENGINE" || ec
 ## 引擎路径
 
 ```bash
-python3 "$ENGINE" --cwd "$PWD" pins --page 1 $ARGUMENTS
+python3 "$ENGINE" --cwd "$PWD" show $ARGUMENTS
 ```
 
 按输出 JSON 处理：
-- `search_results` → 用 AskUserQuestion 展示本页 items（label = display，最多 3 项 + 第 4 项"下一页"，翻页协议同 /pin_search，最多 5 页）。用户选中某项 → 运行 `python3 "$ENGINE" --cwd "$PWD" show --pin-no <item.pin_no>`，拿到 `pin_content` 后按下述【展示】规则展示
-- `error`（code=no_match）且 $ARGUMENTS 为空 → 告知"还没有 pin 任何内容，先用 /pin 或 /pin_search 保存一条吧"
+- `pin_content` → 按下述【展示】规则展示
+- `search_results` → 按【编号列表协议】渲染（元数据行含 pin 时间），请用户回复数字；用户回复后运行 `python3 "$ENGINE" --cwd "$PWD" show <数字>`，拿到 `pin_content` 后展示
+- `error`（code=no_pins）→ 告知"还没有 pinned 消息，先用 /pin 或 /pin_search 保存一条吧"
 - `error`（code=no_match）且有查询词 → 告知"没有匹配「$ARGUMENTS」的 pin"
-- 用户 Esc → 停止
 
 ## 手动路径（无 python3，全平台可用）
 
 ### 1. 读取 pin 文件
 
-Read `~/.claude/pin_message.md`。文件不存在 → 告知"还没有 pin 任何内容，先用 /pin 或 /pin_search 保存一条吧"并停止。
+Read `~/.claude/pin_message.md`。文件不存在 → 告知"还没有 pinned 消息，先用 /pin 或 /pin_search 保存一条吧"并停止。
 首行不是 `<!-- pin-message-format: 1 -->` → 告知"pin 文件格式无法识别（可能被手工修改过），请检查 ~/.claude/pin_message.md"并停止，不要尝试修复或覆盖。
 
 ### 2. 解析条目
 
-按 `## [PIN #N]` 行切分条目，从每条中提取：`<!-- pin-uuid: -->` 标记、`**Q:**` 行（问题摘要，作为 display）、`**A:**` 之后到下一个 `## [` 或文件尾的完整回答。按 PIN 编号倒序（最新在前）。
+按 `## [PIN #N]` 行切分条目，从每条中提取：`<!-- pin-uuid: -->` 标记、标题行中的时间、`**Q:**` 行（问题摘要，作为 display）、`**A:**` 之后到下一个 `## [` 或文件尾的完整回答。按 PIN 编号倒序（最新在前）。
 
-### 3. 过滤 + 选择框
+### 3. 直达或编号列表
 
-有 $ARGUMENTS 时按 display 做大小写不敏感子串过滤（不匹配回答正文）。空结果 → 告知无匹配。然后 AskUserQuestion 展示（最多 3 项 + "下一页"，最多 5 页，协议同 /pin_search）。Esc → 停止。
+$ARGUMENTS 为纯数字 → 直接选中该 PIN 编号（不存在则告知"PIN #N 不存在"）。
+否则：有查询词时按 display 做大小写不敏感子串过滤（不匹配回答正文），空结果 → 告知无匹配。然后按【编号列表协议】渲染，请用户回复数字。
 
 ### 4. 展示 ⚠️ 安全规则
 
@@ -64,6 +68,17 @@ Read `~/.claude/pin_message.md`。文件不存在 → 告知"还没有 pin 任�
 
 ---
 
-## 附：display 摘要规范
+## 编号列表协议（/pin_search / /pin_show / /pin_delete 通用）
 
-选择框中只展示问题摘要（即 pin 文件中的 `**Q:**` 行原文）。如果该行长于 80 字符，截断为前 80 字符 + "…"。
+向用户展示条目时，**逐条渲染为两行式**（标题行 + 元数据行，与 /resume 风格对齐）：
+
+```
+1. <display 摘要>
+   <YYYY-MM-DD HH:MM> · session <session 标识> · <preview 前 60 字符，可省略>
+2. …
+```
+
+然后请用户"回复数字选中（1-N），或回复 q 放弃"。交互规则：
+- 回复纯数字且在 1-N 范围内 → 选中该项，继续执行后续步骤
+- 回复非数字、越界或 q → 提示"请输入 1-N 的数字，或回复 q 放弃"并**重问一次**；再次无效 → 放弃并说明，**总计最多询问 2 次，不循环**
+- 超过 15 条时只展示最近 15 条，附注"仅展示最近 15 条，可用查询词缩小范围"

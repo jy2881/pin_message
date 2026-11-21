@@ -1,7 +1,7 @@
 ---
 description: 把上一轮对话（用户提问 + agent 回答）pin 到 ~/.claude/pin_message.md
 argument-hint: ""
-allowed-tools: Bash, Read, Write, Edit, Glob, AskUserQuestion
+allowed-tools: Bash, Read, Write, Edit, Glob
 ---
 
 # /pin — Pin 上一轮对话
@@ -46,21 +46,21 @@ python3 "$ENGINE" --cwd "$PWD" write-last
 
 # Pinned Messages
 
-## [PIN #1] <当前本地时间 YYYY-MM-DD HH:MM> | session <transcript 文件名前 8 字符>
-<!-- pin-uuid: <该回答 assistant 条目的 uuid> -->
-**Q:** <display 摘要，见规则书第 6 条>
+## [PIN #1] <当前本地时间 YYYY-MM-DD HH:MM> | session <session 标识，见规则书>
+<!-- pin-uuid: <该回答条目的 uuid> -->
+**Q:** <display 摘要，见规则书>
 **A:**
 <完整回答原文>
 ```
-- 已存在 → 检查各条目的 `<!-- pin-uuid: -->` 标记，若与本次 uuid 相同 → 告知"该轮已在 PIN #N 中"并停止；否则用 Edit 在文件末尾追加同格式新条目（N = 最大编号 + 1）。
+- 已存在 → 检查各条目的 `<!-- pin-uuid: -->` 标记，若与本次 uuid 相同（且均非空）→ 告知"该轮已在 PIN #N 中"并停止；否则用 Edit 在文件末尾追加同格式新条目（N = 最大编号 + 1）。
 
 完成后告知用户"已保存为 PIN #N"。
 
 ---
 
-## 规则书（transcript 解析，已针对 Claude Code 2.x 实测验证）
+## 规则书 A：Claude Code transcript 解析（已针对 2.x 实测验证）
 
-**定位**：slug = 当前工作目录绝对路径把每个 `/` 换成 `-`（保留开头 `-`），如 `/Users/pan/work` → `-Users-pan-work`；transcript 目录为 `~/.claude/projects/<slug>/`，取其中修改时间最新的 `.jsonl`。若最新文件修改时间早于 5 分钟，先向用户确认再继续（可能在后台会话中运行）。
+**定位**：slug = 当前工作目录绝对路径把每个 `/` 换成 `-`（保留开头 `-`），如 `/Users/pan/work` → `-Users-pan-work`；transcript 目录为 `~/.claude/projects/<slug>/`，取其中修改时间最新的 `.jsonl`。若最新文件修改时间早于 5 分钟，先向用户确认再继续（可能在后台会话中运行）。session 标识 = 文件名前 8 字符。
 
 **解析**：文件每行一个 JSON 对象；解析失败的行直接忽略。条目文本提取：`message.content` 为字符串则用之；为数组则拼接所有 `{"type":"text"}` 块的 `text` 字段。
 
@@ -74,6 +74,36 @@ python3 "$ENGINE" --cwd "$PWD" write-last
 
 **配对回答**：该提问之后、**下一个合格提问出现之前**，最近一个 `type:assistant` 且 content 含至少一个 text 块的条目，拼接其全部 text 块；跳过仅含 thinking/tool_use 的条目（防止用户打断后答案跨界配对）。
 
-**display 摘要（第 6 条）**：提问中含 `[Pasted text ...]` 占位符行则原样保留；单条文本超过 500 字符则压缩为 `首行(≤80字符) [Pasted text +N lines]`（N = 总行数）；否则取首行截 80 字符。 pasted 占位符示例：`[Pasted text #1 +18 lines]`。
+**display 摘要**：提问中含 `[Pasted text ...]` 占位符行则原样保留；单条文本超过 500 字符则压缩为 `首行(≤80字符) [Pasted text +N lines]`（N = 总行数）；否则取首行截 80 字符。pasted 占位符示例：`[Pasted text #1 +18 lines]`。
 
 **uuid**：取配对 assistant 条目的 `uuid` 字段值（顶层字段）。
+
+## 规则书 B：Codex rollout 解析
+
+**定位**：`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`，取修改时间最新者（Codex rollout 不按 cwd 分组，"当前 session" = 全局最新文件）。session 标识 = 文件名最后一段（uuid 段）前 8 字符。若 CC 与 Codex 记录同时存在，取 mtime 较新一侧并告知用户你选了哪侧。
+
+**条目提取**：
+- `type: "response_item"` 且 `payload.type: "message"`：`role: "user"` 的文本 = `payload.content` 中所有 `{"type":"input_text"}` 块的 `text` 拼接；`role: "assistant"` 同理用 `{"type":"output_text"}` 块
+- 顶层 `type: "user_message"`：`message` 字段即用户文本
+
+**排除**（须全部剔除，不得当提问也不得当回答）：
+- `payload.type` 为 `function_call` / `function_call_output` / `local_shell_call` / `local_shell_call_output` / `reasoning` / `web_search_call` / `mcp_call` / `mcp_call_output`
+- 顶层 `type` 为 `turn_context` / `token_count` / `session_meta`
+
+**fail-loud**：遇到无法识别的行类型 → 停止并告知"无法识别的 Codex 会话格式（codex_parse），请到 github.com/jy2881/pin_message 提 issue"，**不要静默跳过或自行猜测格式**。
+
+**配对回答**：同规则书 A 的边界规则（遇下一合格 user message 即停止）。
+
+**uuid**：取配对条目的 `payload.id`（缺失则留空；留空时跳过 uuid 去重，直接追加）。
+
+## pin 文件格式（双平台共用）
+
+路径 `~/.claude/pin_message.md`（可用环境变量 `PIN_MESSAGE_FILE` 覆盖），首行必须是格式头 `<!-- pin-message-format: 1 -->`。追加条目格式：
+```markdown
+## [PIN #N] <本地时间 YYYY-MM-DD HH:MM> | session <session 标识>
+<!-- pin-uuid: <uuid> -->
+**Q:** <display 摘要>
+**A:**
+<完整回答原文>
+```
+写入前先检查现有条目的 uuid 是否重复（重复则告知已有编号，不追加）。用 Write/Edit 工具写文件。

@@ -7,8 +7,8 @@
     {
       "name": "pin-message",
       "source": "./.claude-plugin/plugin.json",
-      "description": "Pin important Q&A turns from your Claude Code session to ~/.claude/pin_message.md and recall them anytime.",
-      "version": "0.1.0"
+      "description": "Pin important Q&A turns from your Claude Code or Codex CLI session and recall them anytime — numbered-list picker, dual-platform engine.",
+      "version": "0.2.0"
     }
   ]
 }

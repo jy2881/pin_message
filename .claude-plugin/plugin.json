@@ -1,7 +1,7 @@
 {
   "name": "pin-message",
-  "version": "0.1.0",
-  "description": "Pin important Q&A turns from your Claude Code session to ~/.claude/pin_message.md and recall them anytime — like bookmarks for conversation history.",
+  "version": "0.2.0",
+  "description": "Pin important Q&A turns from your Claude Code or Codex CLI session to ~/.claude/pin_message.md and recall them anytime — like bookmarks for conversation history. Numbered-list picker works in both CLIs.",
   "author": {
     "name": "jy2881"
   },

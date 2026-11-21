@@ -423,11 +423,11 @@ def test_cli_output_schemas(env, capsys):
     pin.main(["--cwd", env["cwd"], "delete", "--pin-no", "1"])
     assert json.loads(capsys.readouterr().out)["type"] == "delete_result"
 
-    # 不存在的 cwd → 兜底到全局最新 transcript（本测试 env 里有 -tmp-proj 的 transcript）
+    # 不存在的 cwd 且无祖先会话记录 → 报 no_transcript_dir（不再全局兜底）
     pin.main(["--cwd", "/nonexistent/cwd", "last"])
     captured = capsys.readouterr()
-    assert json.loads(captured.out)["type"] == "qa_pair"
-    assert "cwd_mismatch" in captured.err
+    assert json.loads(captured.out)["type"] == "error"
+    assert json.loads(captured.out)["code"] == "no_transcript_dir"
 
 
 # ---------------------------------------------------------------- spec 16
@@ -748,14 +748,28 @@ def test_locate_transcript_underscore_dir(env, tmp_path):
     assert pairs and pairs[0]["question"] == "Q"
 
 
-def test_locate_falls_back_to_global_newest(env, tmp_path):
-    # 会话内 cd：$PWD 对应 slug 目录不存在 → 兜底用全局最新 transcript
+def test_locate_walks_up_to_ancestor(env, tmp_path):
+    # 会话内 cd：$PWD 自身 slug 目录不存在 → 沿父目录向上找最近的会话目录
+    root = tmp_path / "projects" / "-Users-pan"
+    root.mkdir(parents=True)
+    (root / "sess-12345678.jsonl").write_text(
+        json.dumps(user_entry("根目录问题", uuid="u1")), encoding="utf-8",
+    )
+    # $PWD=/Users/pan/workspace/pin_message，自身与 /Users/pan/workspace 都无记录，
+    # 只有 /Users/pan 有 → 应命中它
+    path, warn = pin.locate_transcript("/Users/pan/workspace/pin_message")
+    assert warn and warn["code"] == "cwd_mismatch"
+    assert path.parent.name == "-Users-pan"
+
+
+def test_locate_does_not_global_fallback(env, tmp_path):
+    # 并发多会话：存在其他项目的 transcript 时，不得跨项目全局兜底
     other = tmp_path / "projects" / "-some-other-project"
     other.mkdir(parents=True)
     (other / "sess-99999999.jsonl").write_text(
         json.dumps(user_entry("别的项目问题", uuid="u9")), encoding="utf-8",
     )
-    path, warn = pin.locate_transcript("/tmp/proj")  # -tmp-proj 目录不存在
-    assert warn and warn["code"] == "cwd_mismatch"
-    assert path.parent.name == "-some-other-project"
+    path, warn = pin.locate_transcript("/tmp/proj")  # 自身及祖先均无记录
+    assert path is None
+    assert warn and warn["type"] == "error" and warn["code"] == "no_transcript_dir"
 

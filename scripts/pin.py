@@ -99,56 +99,53 @@ def slug_for(cwd: str) -> str:
 
 
 def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:
-    """定位 CC 当前 session 的 transcript（cwd-slug 目录下 mtime 最新者）。
+    """定位 CC 当前 session 的 transcript（当前目录或其祖先目录 slug 下 mtime 最新者）。
 
-    返回 (path, payload)。目录不存在/无 jsonl → (None, error 载荷)。
+    返回 (path, payload)。找不到 → (None, error 载荷)。
     mtime 早于 STALE_SECONDS → (path, stale_transcript warn)。
 
-    兜底：$PWD 与 session 起始目录不一致（会话内 cd）时，cwd-slug 目录不存在，
-    改用全局最新 transcript（当前 session 正被写入，必是全局最新者），并附
-    cwd_mismatch warn。
+    会话内 cd：$PWD 与 session 起始目录不一致时，cwd 自身 slug 目录不存在，
+    沿父目录向上找最近的、在 ~/.claude/projects 下有会话记录的目录，并附
+    cwd_mismatch warn。不跨项目全局搜索（并发多会话时全局最新者会误选别的 session）。
     """
-    slug_dir = PROJECTS_DIR / slug_for(cwd)
-    warn = None
-    if not slug_dir.is_dir():
-        newest = max(
-            PROJECTS_DIR.rglob("*.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            default=None,
-        )
-        if newest is None:
-            return None, {
-                "type": "error",
-                "code": "no_transcript_dir",
-                "message": f"找不到 CC 会话记录目录：{slug_dir}",
+    start = Path(cwd)
+    for ancestor in (start, *start.parents):
+        slug_dir = PROJECTS_DIR / slug_for(str(ancestor))
+        if not slug_dir.is_dir():
+            continue
+        files = sorted(slug_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        if not files:
+            continue  # 空目录（历史会话已清理），继续向上找
+        newest = files[-1]
+        if ancestor != start:
+            warn = {
+                "type": "warn",
+                "code": "cwd_mismatch",
+                "message": (
+                    f"当前目录 {cwd} 没有会话记录，已改用其父目录 "
+                    f"{ancestor} 对应的会话（会话内 cd 过，或会话起始于该目录）"
+                ),
             }
-        slug_dir = newest.parent
-        warn = {
-            "type": "warn",
-            "code": "cwd_mismatch",
-            "message": (
-                f"当前目录 {cwd} 没有会话记录，已改用全局最新会话 "
-                f"{slug_dir.name}（可能因为会话内 cd，或会话起始于其他目录）"
-            ),
-        }
-    files = sorted(slug_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
-    if not files:
-        return None, {
-            "type": "error",
-            "code": "no_transcript_dir",
-            "message": f"目录中没有任何 .jsonl 会话文件：{slug_dir}",
-        }
-    newest = files[-1]
-    if warn is None and time.time() - newest.stat().st_mtime > STALE_SECONDS:
-        warn = {
-            "type": "warn",
-            "code": "stale_transcript",
-            "message": (
-                f"最新会话文件 {newest.name} 的修改时间超过 "
-                f"{STALE_SECONDS // 60} 分钟，可能是后台会话。确认后继续。"
-            ),
-        }
-    return newest, warn
+        elif time.time() - newest.stat().st_mtime > STALE_SECONDS:
+            warn = {
+                "type": "warn",
+                "code": "stale_transcript",
+                "message": (
+                    f"最新会话文件 {newest.name} 的修改时间超过 "
+                    f"{STALE_SECONDS // 60} 分钟，可能是后台会话。确认后继续。"
+                ),
+            }
+        else:
+            warn = None
+        return newest, warn
+    return None, {
+        "type": "error",
+        "code": "no_transcript_dir",
+        "message": (
+            f"找不到 CC 会话记录目录：{PROJECTS_DIR / slug_for(cwd)}"
+            "（已沿父目录向上查找）"
+        ),
+    }
 
 
 def iter_entries(path: Path) -> Iterator[dict]:

@@ -10,28 +10,26 @@ allowed-tools: Bash, Read, Write, Edit, Glob, AskUserQuestion
 
 参数 `$ARGUMENTS` = 查询词（可空）。查询词为**大小写不敏感子串匹配，只匹配问题摘要不匹配回答正文**。
 
-## 步骤 1：检测引擎
+## 步骤 1：定位引擎并执行（单次 Bash，检测与首调合并）
 
 执行：
 ```bash
 ENGINE=$(find "$HOME/workspace/pin_message/scripts" "$HOME/.claude/plugins" -name pin.py 2>/dev/null | head -1)
-command -v python3 >/dev/null && [ -n "$ENGINE" ] && echo "ENGINE=$ENGINE" || echo "NO_ENGINE"
+if command -v python3 >/dev/null && [ -n "$ENGINE" ]; then
+  python3 "$ENGINE" --cwd "$PWD" search $ARGUMENTS
+else
+  echo "NO_ENGINE"
+fi
 ```
 
-输出以 `ENGINE=` 开头 → 走【引擎路径】；否则 → 走【手动路径】。
-
-## 引擎路径
-
-```bash
-python3 "$ENGINE" --cwd "$PWD" search $ARGUMENTS
-```
+输出以 `{` 开头（引擎单行 JSON）→ 走【引擎路径】按输出处理；输出为 `NO_ENGINE` → 走【手动路径】。
 
 按输出 JSON 处理：
 - `search_results` → 按【选择协议】用 AskUserQuestion 呈现候选
 - `error`（code=no_match）→ 告知"没有匹配「$ARGUMENTS」的提问"，建议换查询词或不带查询词重试
 - `warn` → 原样转达用户后继续
 
-用户选中后：取该 item 的 `uuid`，运行 `python3 "$ENGINE" --cwd "$PWD" write --uuid <uuid>`，按输出处理（`write_result` → 告知"已保存为 PIN #N"；`duplicate` → 告知"该轮已在 PIN #N 中"；其他 error → 原样转达）。
+用户选中后：取该 item 的 `uuid`，运行 `python3 "$(find "$HOME/workspace/pin_message/scripts" "$HOME/.claude/plugins" -name pin.py 2>/dev/null | head -1)" --cwd "$PWD" write --uuid <uuid>`，按输出处理（`write_result` → 告知"已保存为 PIN #N"；`duplicate` → 告知"该轮已在 PIN #N 中"；其他 error → 原样转达）。
 
 ## 手动路径（无 python3，全平台可用）
 
@@ -61,7 +59,7 @@ python3 "$ENGINE" --cwd "$PWD" search $ARGUMENTS
 
 每条候选 item → 一个 option：
 - `label`：display 摘要（过长截断到约 40 字符）
-- `description`：`session <session>`，若 ts 非空再追加 ` · <YYYY-MM-DD HH:MM>`
+- `description`：`session <session> · <YYYY-MM-DD HH:MM>`（/pin_search 无 pin_no；`<YYYY-MM-DD HH:MM>` 即引擎 `ts` 字段，已转本机时间；ts 为空则省略该段及其前导 ` · `）
 
 映射规则：
 - `multiSelect` 固定 `false`；单个 question，header 用「选择 pin」

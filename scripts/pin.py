@@ -20,7 +20,8 @@
               │       → codex_parse fail-loud（附行样本，不静默猜）
         真实用户提问
               │
-              ▼  配对：其后最近 textual assistant；遇下一合格 user 即停止
+              ▼  配对：其后最后一段 textual assistant（取最终回答，跳过规划器/工具回传）；
+              │       遇下一 user 边界（真实提问或 sidechain/meta）即停止
         QA 对 ──compress──▶ display（[Pasted text #N +X lines] 风格）
 
 编号列表协议（v2，替代 v1 分页协议）：
@@ -241,11 +242,24 @@ def is_textual_assistant(entry: dict) -> bool:
     return False
 
 
+def is_user_boundary(entry: dict) -> bool:
+    """type=user 且非 tool_result → 回答窗口边界。
+
+    真实提问是下一个问答对；sidechain/meta/斜杠命令/打断标记是子对话或系统注入，
+    其回答都不得泄漏进当前窗口。tool_result 属于同一轮工具回传，不构成边界。
+    """
+    if entry.get("type") != "user":
+        return False
+    return not has_tool_result(entry)
+
+
 def extract_qa_pairs(entries: list[dict]) -> list[dict]:
     """从解析后的条目流提取 QA 对列表（按时间顺序）。
 
-    配对规则：真实提问 → 其后最近的 textual assistant；
-    搜索遇下一个真实提问（或文件结束）即停止 —— 防止打断后跨界配对。
+    配对规则：真实提问 → 其后**最后一段** textual assistant（agent 一轮可能
+    先规划/反思、再工具调用、最后总结，答案应是最终那段 text，而非规划器文本）；
+    搜索遇下一个 user 边界（真实提问或 sidechain/meta）即停止 —— 防止打断后
+    跨界配对、防止侧链回答泄漏进上一个真实问题的答案。
     """
     pairs: list[dict] = []
     i = 0
@@ -256,27 +270,28 @@ def extract_qa_pairs(entries: list[dict]) -> list[dict]:
             i += 1
             continue
         answer = None
+        answer_uuid = ""
         answer_ts = None
         j = i + 1
         while j < n:
             nxt = entries[j]
-            if is_real_user_question(nxt):
-                break  # 配对边界：下一个合格提问出现即止
+            if is_user_boundary(nxt):
+                break  # 下一真实提问 / sidechain / meta → 窗口结束
             if is_textual_assistant(nxt):
                 answer = entry_text(nxt)
+                answer_uuid = nxt.get("uuid", "")
                 answer_ts = nxt.get("timestamp", "")
-                break
             j += 1
         pairs.append(
             {
                 "question": entry_text(entry),
                 "answer": answer if answer is not None else "",
-                "uuid": entries[j].get("uuid", "") if (answer is not None and j < n) else "",
+                "uuid": answer_uuid,
                 "timestamp": answer_ts or entry.get("timestamp", ""),
                 "has_answer": answer is not None,
             }
         )
-        i = max(j, i + 1) if answer is not None else i + 1
+        i = j  # 推进到窗口结束处；外层循环继续处理下一真实提问
     return pairs
 
 
@@ -383,6 +398,24 @@ def resolve_transcript(
 # ================================================================ pinstore 段
 
 
+def fmt_ts(ts: str) -> str:
+    """ISO 时间戳 → 本机时间显示串 "YYYY-MM-DD HH:MM"。
+
+    transcript 时间戳为 UTC（如 2026-11-20T10:18:21.001Z）→ 转本机时间；
+    pin 文件回读的已是本机显示串（无 T）→ 原样返回（幂等，delete 重渲染不漂移）。
+    """
+    ts = (ts or "").strip()
+    if not ts:
+        return ""
+    if "T" not in ts:  # 已是本机显示串（或非 ISO）→ 原样
+        return ts[:16]
+    try:
+        norm = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+        return datetime.fromisoformat(norm).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts[:16].replace("T", " ")
+
+
 def parse_store(text: str) -> list[dict]:
     """解析 pin 文件为条目列表。无格式头 → 视为损坏（调用方负责备份重建）。"""
     if not text.strip():
@@ -402,11 +435,15 @@ def parse_store(text: str) -> list[dict]:
             session = header.split("|")[-1].strip() if "|" in header else ""
             if session.startswith("session "):
                 session = session[len("session "):]
+            timestamp = ""
+            if "|" in header:  # 标题形如 "## [PIN #N] <ts> | session <s>"，ts 可为空
+                left = header.split("|", 1)[0]
+                timestamp = re.sub(r"^## \[PIN #\d+\]\s*", "", left).strip()
             current = {
                 "pin_no": pin_no,
                 "uuid": "",
                 "session": session,
-                "timestamp": "",
+                "timestamp": timestamp,
                 "question": "",
                 "answer": "",
             }
@@ -433,7 +470,7 @@ def render_store(entries: list[dict]) -> str:
     """条目列表 → pin 文件全文（重新顺序编号）。"""
     parts = [FORMAT_HEADER, "", "# Pinned Messages", ""]
     for i, e in enumerate(entries, 1):
-        ts = e.get("timestamp", "")[:16].replace("T", " ")
+        ts = fmt_ts(e.get("timestamp", ""))
         parts.append(f"## [PIN #{i}] {ts} | session {e.get('session', '')}")
         parts.append(f"<!-- pin-uuid: {e.get('uuid', '')} -->")
         parts.append(f"**Q:** {e.get('question', '')}")
@@ -550,7 +587,7 @@ def list_items(items: list[dict]) -> dict:
             {
                 "index": i + 1,
                 "display": e["display"],
-                "ts": (e.get("timestamp", "") or "")[:16].replace("T", " "),
+                "ts": fmt_ts(e.get("timestamp", "")),
                 "session": e.get("session", ""),
                 "uuid": e.get("uuid", ""),
                 "pin_no": e.get("pin_no"),

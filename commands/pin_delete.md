@@ -13,29 +13,28 @@ allowed-tools: Bash, Read, Write, Edit, Glob, AskUserQuestion
 - 其他文本 → 查询词（大小写不敏感子串匹配，只匹配问题摘要不匹配回答正文）
 - 空 → 列出全部条目（最近在前）
 
-## 步骤 1：检测引擎
+## 步骤 1：定位引擎并执行（单次 Bash，检测与首调合并）
 
 执行：
 ```bash
 ENGINE=$(find "$HOME/workspace/pin_message/scripts" "$HOME/.claude/plugins" -name pin.py 2>/dev/null | head -1)
-command -v python3 >/dev/null && [ -n "$ENGINE" ] && echo "ENGINE=$ENGINE" || echo "NO_ENGINE"
+if command -v python3 >/dev/null && [ -n "$ENGINE" ]; then
+  python3 "$ENGINE" --cwd "$PWD" delete $ARGUMENTS
+else
+  echo "NO_ENGINE"
+fi
 ```
 
-输出以 `ENGINE=` 开头 → 走【引擎路径】；否则 → 走【手动路径】。
-
-## 引擎路径
-
-```bash
-python3 "$ENGINE" --cwd "$PWD" delete $ARGUMENTS
-```
+输出以 `{` 开头（引擎单行 JSON）→ 走【引擎路径】按输出处理；输出为 `NO_ENGINE` → 走【手动路径】。
 
 按输出 JSON 处理：
-- `search_results` → 按【选择协议】用 AskUserQuestion 呈现候选；选中后运行 `python3 "$ENGINE" --cwd "$PWD" show <pin_no>` 取回该条内容，进入二次确认
+- `search_results` → 按【选择协议】用 AskUserQuestion 呈现候选；选中后运行 `python3 "$(find "$HOME/workspace/pin_message/scripts" "$HOME/.claude/plugins" -name pin.py 2>/dev/null | head -1)" --cwd "$PWD" show <pin_no>` 取回该条内容，进入二次确认
 - `error`（code=no_pins）→ 告知"还没有 pinned 消息"
 - `error`（code=no_match）且有查询词 → 告知无匹配
 
 选中条目后**二次确认**（⚠️ 必须，不可省略）：向用户单独追问"确认删除 PIN #N：<display 摘要>？此操作不可撤销。[y/n]"，只有明确回复 y/是/确认 才执行：
 ```bash
+ENGINE=$(find "$HOME/workspace/pin_message/scripts" "$HOME/.claude/plugins" -name pin.py 2>/dev/null | head -1)
 python3 "$ENGINE" --cwd "$PWD" delete <N>
 ```
 按 `delete_result` 告知"已删除 PIN #N，剩余 M 条"。回复其他内容 → 视为取消，告知"已取消删除"。
@@ -62,7 +61,7 @@ python3 "$ENGINE" --cwd "$PWD" delete <N>
 
 每条候选 item → 一个 option：
 - `label`：display 摘要（过长截断到约 40 字符）
-- `description`：`session <session>`，若 ts 非空再追加 ` · <YYYY-MM-DD HH:MM>`
+- `description`：`PIN #<pin_no> · session <session> · <YYYY-MM-DD HH:MM>`（`<YYYY-MM-DD HH:MM>` 即引擎 `ts` 字段，已转本机时间；ts 为空则省略该段及其前导 ` · `）
 
 映射规则：
 - `multiSelect` 固定 `false`；单个 question，header 用「选择 pin」

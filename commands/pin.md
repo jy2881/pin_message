@@ -8,21 +8,19 @@ allowed-tools: Bash, Read, Write, Edit, Glob
 
 将当前 session 中**最近一个真实用户提问 + agent 回答**写入 `~/.claude/pin_message.md`（文件不存在则创建，已有内容则追加，按 uuid 去重）。
 
-## 步骤 1：检测引擎
+## 步骤 1：定位引擎并执行（单次 Bash，检测与首调合并）
 
 执行：
 ```bash
 ENGINE=$(find "$HOME/workspace/pin_message/scripts" "$HOME/.claude/plugins" -name pin.py 2>/dev/null | head -1)
-command -v python3 >/dev/null && [ -n "$ENGINE" ] && echo "ENGINE=$ENGINE" || echo "NO_ENGINE"
+if command -v python3 >/dev/null && [ -n "$ENGINE" ]; then
+  python3 "$ENGINE" --cwd "$PWD" write-last
+else
+  echo "NO_ENGINE"
+fi
 ```
 
-输出以 `ENGINE=` 开头 → 走【引擎路径】；否则 → 走【手动路径】。
-
-## 引擎路径
-
-```bash
-python3 "$ENGINE" --cwd "$PWD" write-last
-```
+输出以 `{` 开头（引擎单行 JSON）→ 走【引擎路径】按输出处理；输出为 `NO_ENGINE` → 走【手动路径】。
 
 按输出 JSON 处理：
 - `write_result` → 告知用户"已保存为 PIN #N"

@@ -169,6 +169,27 @@ def test_extract_basic_and_exclusions(env):
     assert pairs[0]["uuid"] == "a1"
 
 
+def test_pairing_takes_final_answer_not_planner(env):
+    # agent 一轮：thinking → tool_use → 规划文本 → tool_use → 最终回答。
+    # 答案应是最后一段 text，而非规划器"Now I'll implement..."。
+    entries = [
+        user_entry("可以，合并吧", uuid="u1"),
+        assistant_entry("", uuid="a0", blocks=[{"type": "thinking", "thinking": "..."}]),
+        assistant_entry("", uuid="a1", blocks=[{"type": "tool_use", "name": "Read"}]),
+        progress_entry(),
+        tool_result_user(uuid="tr1"),
+        assistant_entry("Now I'll implement the merge", uuid="a2"),
+        assistant_entry("", uuid="a3", blocks=[{"type": "tool_use", "name": "Edit"}]),
+        tool_result_user(uuid="tr2"),
+        assistant_entry("合并完成，测试通过", uuid="a4"),
+    ]
+    pairs = pin.extract_qa_pairs(entries)
+    assert len(pairs) == 1
+    assert pairs[0]["question"] == "可以，合并吧"
+    assert pairs[0]["answer"] == "合并完成，测试通过"
+    assert pairs[0]["uuid"] == "a4"
+
+
 # ---------------------------------------------------------------- spec 3
 
 
@@ -443,6 +464,45 @@ def test_delete_renumbers(env):
     assert [e["pin_no"] for e in entries] == [1, 2]  # 重新编号
     text = pin.PIN_FILE.read_text(encoding="utf-8")
     assert "## [PIN #2]" in text and "Q2" in text
+
+
+# ---------------------------------------------------------------- 时间戳（本机时间）
+
+
+def test_fmt_ts_utc_to_local_and_idempotent():
+    import re as _re
+    # UTC ISO → 本机时间显示串（形状稳定，不断言具体时区，跨 CI 时区不脆）
+    local = pin.fmt_ts("2026-11-20T10:18:21.001Z")
+    assert _re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", local)
+    # 幂等：本机显示串回读不再转换
+    assert pin.fmt_ts(local) == local
+    assert pin.fmt_ts("") == ""
+
+
+def test_parse_store_extracts_timestamp():
+    text = (
+        "<!-- pin-message-format: 1 -->\n\n# Pinned Messages\n\n"
+        "## [PIN #1] 2026-11-20 18:18 | session sess1234\n"
+        "<!-- pin-uuid: u1 -->\n**Q:** 问题\n**A:**\n回答\n"
+        "## [PIN #2]  | session sess1234\n"
+        "<!-- pin-uuid: u2 -->\n**Q:** 空时间戳\n**A:**\n答\n"
+    )
+    entries = pin.parse_store(text)
+    assert entries[0]["timestamp"] == "2026-11-20 18:18"
+    assert entries[0]["session"] == "sess1234"
+    assert entries[1]["timestamp"] == ""  # 空时间戳标题也能正确解析
+
+
+def test_timestamp_survives_delete_renumber(env):
+    # 回归：delete 重渲染不得把时间戳抹掉（原 parse_store 永远置空导致丢时间）
+    with pin.PinStore() as store:
+        store.append("u1", "s", "Q1", "A1", "2026-11-20T10:00:00.000Z")
+        store.append("u2", "s", "Q2", "A2", "2026-11-21T07:29:03.125Z")
+        store.delete(1)
+    entries, _ = pin.read_store()
+    assert entries[0]["question"] == "Q2"
+    ts = entries[0]["timestamp"]
+    assert ts and "T" not in ts and "Z" not in ts  # 已转本机显示串，非空
 
 
 # ---------------------------------------------------------------- 端到端冒烟

@@ -1,12 +1,12 @@
 ---
-description: 搜索当前 session 的历史提问，回复数字选中后 pin 到 ~/.claude/pin_message.md
+description: 搜索当前 session 的历史提问，选择框选中后 pin 到 ~/.claude/pin_message.md
 argument-hint: "[查询词]"
-allowed-tools: Bash, Read, Write, Edit, Glob
+allowed-tools: Bash, Read, Write, Edit, Glob, AskUserQuestion
 ---
 
 # /pin_search — 搜索并 Pin 历史提问
 
-在当前 session 中提取全部"真实用户提问"（按【文末规则书】），以**编号列表**展示，用户回复数字选中一条，将其问答对写入 `~/.claude/pin_message.md`。
+在当前 session 中提取全部"真实用户提问"（按【文末规则书】），以**选择框**展示，用户选中一条，将其问答对写入 `~/.claude/pin_message.md`。
 
 参数 `$ARGUMENTS` = 查询词（可空）。查询词为**大小写不敏感子串匹配，只匹配问题摘要不匹配回答正文**。
 
@@ -27,11 +27,11 @@ python3 "$ENGINE" --cwd "$PWD" search $ARGUMENTS
 ```
 
 按输出 JSON 处理：
-- `search_results` → 按【编号列表协议】渲染，请用户回复数字选中
+- `search_results` → 按【选择协议】用 AskUserQuestion 呈现候选
 - `error`（code=no_match）→ 告知"没有匹配「$ARGUMENTS」的提问"，建议换查询词或不带查询词重试
 - `warn` → 原样转达用户后继续
 
-用户回复数字选中后：取该 item 的 `uuid`，运行 `python3 "$ENGINE" --cwd "$PWD" write --uuid <uuid>`，按输出处理（`write_result` → 告知"已保存为 PIN #N"；`duplicate` → 告知"该轮已在 PIN #N 中"；其他 error → 原样转达）。
+用户选中后：取该 item 的 `uuid`，运行 `python3 "$ENGINE" --cwd "$PWD" write --uuid <uuid>`，按输出处理（`write_result` → 告知"已保存为 PIN #N"；`duplicate` → 告知"该轮已在 PIN #N 中"；其他 error → 原样转达）。
 
 ## 手动路径（无 python3，全平台可用）
 
@@ -45,9 +45,9 @@ python3 "$ENGINE" --cwd "$PWD" search $ARGUMENTS
 
 若 $ARGUMENTS 非空：仅保留 display 摘要（规则书 display 摘要节）中包含该查询词（大小写不敏感）的条目。过滤后为空 → 告知"没有匹配「$ARGUMENTS」的提问"并停止。
 
-### 3. 编号列表选择
+### 3. 选择
 
-按【编号列表协议】渲染，请用户回复数字选中。
+按【选择协议】用 AskUserQuestion 呈现候选。
 
 ### 4. 写入
 
@@ -55,22 +55,20 @@ python3 "$ENGINE" --cwd "$PWD" search $ARGUMENTS
 
 ---
 
-## 编号列表协议（/pin_search / /pin_show / /pin_delete 通用）
+## 选择协议（/pin_search / /pin_show / /pin_delete 通用）
 
-向用户展示条目时，**逐条渲染为两行式**（标题行 + 元数据行，与 /resume 风格对齐）：
+用 `AskUserQuestion` 工具呈现候选条目（单选 radio 选择框，**不再用文字编号列表**）。
 
-```
-1. <display 摘要>
-   <YYYY-MM-DD HH:MM> · session <session 标识> · <preview 前 60 字符，可省略>
-2. …
-```
+每条候选 item → 一个 option：
+- `label`：display 摘要（过长截断到约 40 字符）
+- `description`：`session <session>`，若 ts 非空再追加 ` · <YYYY-MM-DD HH:MM>`
 
-然后请用户"回复数字选中（1-N），或回复 q 放弃"。交互规则：
-- 回复纯数字且在 1-N 范围内 → 选中该项，继续执行后续步骤
-- 回复非数字、越界或 q → 提示"请输入 1-N 的数字，或回复 q 放弃"并**重问一次**；再次无效 → 放弃并说明，**总计最多询问 2 次，不循环**
-- 引擎输出 `truncated: true`（或手动路径超过 15 条）时，附注"仅展示最近 15 条，可用查询词缩小范围"
-
-已知噪声：用户回复的数字会被下次 /pin_search 提取为一条"提问"（display 就是 "2"），无害，忽略即可。
+映射规则：
+- `multiSelect` 固定 `false`；单个 question，header 用「选择 pin」
+- 候选 ≤ 4 条 → 一次全部呈现
+- 候选 > 4 条 → 只取最近 4 条，question 文本末尾注明「共 N 条，仅展示最近 4 条，可用查询词缩小范围」
+- 构建 option 时按顺序记住 label ↔ item 的对应关系；用户选中后用返回的 label 反查 item，取该 item 的 `pin_no`（/pin_show、/pin_delete）或 `uuid`（/pin_search）继续后续步骤
+- 用户选「Other」：输入为纯数字且对应条目存在 → 视为选中该条；否则视为放弃，停止并说明
 
 ## 规则书 A：Claude Code transcript 解析（已针对 2.x 实测验证）
 

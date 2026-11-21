@@ -74,7 +74,7 @@ python3 "$ENGINE" --cwd "$PWD" search $ARGUMENTS
 
 ## 规则书 A：Claude Code transcript 解析（已针对 2.x 实测验证）
 
-**定位**：slug = 当前工作目录绝对路径把每个 `/` 换成 `-`（保留开头 `-`），如 `/Users/pan/work` → `-Users-pan-work`；transcript 目录为 `~/.claude/projects/<slug>/`，取其中修改时间最新的 `.jsonl`。若最新文件修改时间早于 5 分钟，先向用户确认再继续（可能在后台会话中运行）。session 标识 = 文件名前 8 字符。
+**定位**：slug = 当前工作目录绝对路径中每段**非字母数字**字符（`/`、`_` 等）替换为单个 `-`，大小写保留，如 `/Users/pan/face_recon` → `-Users-pan-face-recon`（⚠️ `_` 也会变成 `-`，不只是 `/`）；transcript 目录为 `~/.claude/projects/<slug>/`，取其中修改时间最新的 `.jsonl`。若最新文件修改时间早于 5 分钟，先向用户确认再继续（可能在后台会话中运行）。session 标识 = 文件名前 8 字符。
 
 **解析**：文件每行一个 JSON 对象；解析失败的行直接忽略。条目文本提取：`message.content` 为字符串则用之；为数组则拼接所有 `{"type":"text"}` 块的 `text` 字段。
 

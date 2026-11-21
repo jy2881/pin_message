@@ -89,8 +89,13 @@ class BadFormatError(Exception):
 
 
 def slug_for(cwd: str) -> str:
-    """cwd → Claude Code 项目目录 slug：绝对路径每个 '/' 替换为 '-'，保留前导 '-'。"""
-    return cwd.replace("/", "-")
+    """cwd → Claude Code 项目目录 slug。
+
+    CC 实测编码规则：把路径中每段非 [A-Za-z0-9] 字符（`/`、`_` 等）替换为单个 `-`，
+    大小写保留。例：/Users/pan/pythonProjects/face_recon → -Users-pan-pythonProjects-face-recon。
+    （旧实现只替换 `/`，漏掉 `_`，导致含下划线目录的项目找不到 transcript。）
+    """
+    return re.sub(r"[^A-Za-z0-9]+", "-", cwd)
 
 
 def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:

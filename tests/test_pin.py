@@ -716,3 +716,31 @@ def test_install_sh_idempotent(tmp_path):
     assert pin_file.read_text(encoding="utf-8") == before
     assert "已存在，跳过" in r2.stdout
 
+
+# ---- [BUGFIX] CC slug 编码：`_` 等非字母数字字符也要转成 `-`（旧实现只换 `/`）
+
+
+def test_slug_encoding_matches_cc():
+    # CC 实测：/Users/pan/pythonProjects/face_recon → -Users-pan-pythonProjects-face-recon
+    assert pin.slug_for("/Users/pan/pythonProjects/face_recon") == "-Users-pan-pythonProjects-face-recon"
+    assert pin.slug_for("/Users/pan/audio_e2e_test") == "-Users-pan-audio-e2e-test"
+    # 大小写保留
+    assert pin.slug_for("/Users/pan/Test_Case_Collection_Platform") == "-Users-pan-Test-Case-Collection-Platform"
+    # 无下划线的常规路径不受影响
+    assert pin.slug_for("/Users/pan/work") == "-Users-pan-work"
+
+
+def test_locate_transcript_underscore_dir(env, tmp_path):
+    # 项目目录含下划线：transcript 落在 `-` 编码的 slug 目录，须能被定位
+    cwd = "/Users/pan/pythonProjects/face_recon"
+    slug_dir = tmp_path / "projects" / "-Users-pan-pythonProjects-face-recon"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "sess-12345678.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in [user_entry("Q", uuid="u1"), assistant_entry("A", uuid="a1")]),
+        encoding="utf-8",
+    )
+    pairs, path, source, payload = pin.load_pairs(cwd, "auto")
+    assert source == "cc"
+    assert not payload or payload["type"] == "warn"  # 定位成功；env fixture 可能附 stale warn
+    assert pairs and pairs[0]["question"] == "Q"
+

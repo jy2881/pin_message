@@ -103,13 +103,33 @@ def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:
 
     返回 (path, payload)。目录不存在/无 jsonl → (None, error 载荷)。
     mtime 早于 STALE_SECONDS → (path, stale_transcript warn)。
+
+    兜底：$PWD 与 session 起始目录不一致（会话内 cd）时，cwd-slug 目录不存在，
+    改用全局最新 transcript（当前 session 正被写入，必是全局最新者），并附
+    cwd_mismatch warn。
     """
     slug_dir = PROJECTS_DIR / slug_for(cwd)
+    warn = None
     if not slug_dir.is_dir():
-        return None, {
-            "type": "error",
-            "code": "no_transcript_dir",
-            "message": f"找不到 CC 会话记录目录：{slug_dir}",
+        newest = max(
+            PROJECTS_DIR.rglob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            default=None,
+        )
+        if newest is None:
+            return None, {
+                "type": "error",
+                "code": "no_transcript_dir",
+                "message": f"找不到 CC 会话记录目录：{slug_dir}",
+            }
+        slug_dir = newest.parent
+        warn = {
+            "type": "warn",
+            "code": "cwd_mismatch",
+            "message": (
+                f"当前目录 {cwd} 没有会话记录，已改用全局最新会话 "
+                f"{slug_dir.name}（可能因为会话内 cd，或会话起始于其他目录）"
+            ),
         }
     files = sorted(slug_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
     if not files:
@@ -119,8 +139,8 @@ def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:
             "message": f"目录中没有任何 .jsonl 会话文件：{slug_dir}",
         }
     newest = files[-1]
-    if time.time() - newest.stat().st_mtime > STALE_SECONDS:
-        return newest, {
+    if warn is None and time.time() - newest.stat().st_mtime > STALE_SECONDS:
+        warn = {
             "type": "warn",
             "code": "stale_transcript",
             "message": (
@@ -128,7 +148,7 @@ def locate_transcript(cwd: str) -> tuple[Optional[Path], Optional[dict]]:
                 f"{STALE_SECONDS // 60} 分钟，可能是后台会话。确认后继续。"
             ),
         }
-    return newest, None
+    return newest, warn
 
 
 def iter_entries(path: Path) -> Iterator[dict]:

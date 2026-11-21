@@ -423,8 +423,11 @@ def test_cli_output_schemas(env, capsys):
     pin.main(["--cwd", env["cwd"], "delete", "--pin-no", "1"])
     assert json.loads(capsys.readouterr().out)["type"] == "delete_result"
 
+    # 不存在的 cwd → 兜底到全局最新 transcript（本测试 env 里有 -tmp-proj 的 transcript）
     pin.main(["--cwd", "/nonexistent/cwd", "last"])
-    assert json.loads(capsys.readouterr().out)["type"] == "error"
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["type"] == "qa_pair"
+    assert "cwd_mismatch" in captured.err
 
 
 # ---------------------------------------------------------------- spec 16
@@ -743,4 +746,16 @@ def test_locate_transcript_underscore_dir(env, tmp_path):
     assert source == "cc"
     assert not payload or payload["type"] == "warn"  # 定位成功；env fixture 可能附 stale warn
     assert pairs and pairs[0]["question"] == "Q"
+
+
+def test_locate_falls_back_to_global_newest(env, tmp_path):
+    # 会话内 cd：$PWD 对应 slug 目录不存在 → 兜底用全局最新 transcript
+    other = tmp_path / "projects" / "-some-other-project"
+    other.mkdir(parents=True)
+    (other / "sess-99999999.jsonl").write_text(
+        json.dumps(user_entry("别的项目问题", uuid="u9")), encoding="utf-8",
+    )
+    path, warn = pin.locate_transcript("/tmp/proj")  # -tmp-proj 目录不存在
+    assert warn and warn["code"] == "cwd_mismatch"
+    assert path.parent.name == "-some-other-project"
 
